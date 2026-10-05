@@ -1228,6 +1228,34 @@
     },
     "request": {
       "$defs": {
+        "AgentAcknowledgeParams": {
+          "description": "Identity-bound confirmation of one already-recorded agent completion.\n\n`terminal_id`, `completion_seq`, and (when present) `agent_session_value` must all come from\nthe same `agent.get` read, so a token minted by an earlier server boot is rejected instead of\nclearing a newer completion that happens to reuse the same sequence number.",
+          "properties": {
+            "agent_session_value": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "completion_seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "target": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "terminal_id",
+            "completion_seq"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -5276,6 +5304,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.acknowledge",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentAcknowledgeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.read",
               "type": "string"
             },
@@ -6540,6 +6584,13 @@
     },
     "success_response": {
       "$defs": {
+        "AgentAcknowledgeOutcome": {
+          "enum": [
+            "acknowledged",
+            "already_acknowledged"
+          ],
+          "type": "string"
+        },
         "AgentInfo": {
           "properties": {
             "agent": {
@@ -9513,6 +9564,26 @@
             },
             {
               "properties": {
+                "agent": {
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
+                "outcome": {
+                  "$ref": "#/schemas/success_response/$defs/AgentAcknowledgeOutcome"
+                },
+                "type": {
+                  "const": "agent_completion_acknowledged",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "outcome"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "active": {
                   "type": "boolean"
                 },
@@ -10420,6 +10491,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_completion_ack": {
+              "default": false,
+              "description": "Whether this server accepts `agent.acknowledge` for a recorded completion. Older servers\nreject the method entirely, and `AgentInfo.completion_seq` alone cannot distinguish them.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"

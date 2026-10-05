@@ -475,4 +475,46 @@ mod tests {
         assert!(!presentation.acknowledge_surface(&mut completed, &surface(2), Some(false)));
         assert_eq!(completed.agents[0].agent_status, AgentStatus::Done);
     }
+
+    /// A background acknowledgement never reaches this client, so the removal of the pane from the
+    /// companion has to clear the Done badge on its own.
+    #[test]
+    fn completion_ack_companion_without_pane_clears_done() {
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut working = snapshot(AgentStatus::Working, 1, 1);
+        presentation.project_snapshot(&mut working);
+        presentation.receive_completions(None, completions("endpoint-boot", 2, Some(2)));
+        let mut completed = snapshot(AgentStatus::Idle, 2, 2);
+        presentation.project_snapshot(&mut completed);
+        assert_eq!(completed.agents[0].agent_status, AgentStatus::Done);
+
+        presentation.receive_completions(None, completions("endpoint-boot", 3, None));
+        let mut acknowledged = snapshot(AgentStatus::Idle, 2, 3);
+
+        presentation.project_snapshot(&mut acknowledged);
+
+        assert_eq!(acknowledged.agents[0].agent_status, AgentStatus::Idle);
+    }
+
+    /// Server authority must win over the client's remembered work: once the companion no longer
+    /// reports the completion, the local `observed_work` fallback must not re-mark Done.
+    #[test]
+    fn completion_ack_fallback_is_not_reached_with_companion() {
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut working = snapshot(AgentStatus::Working, 1, 1);
+        presentation.project_snapshot(&mut working);
+        presentation.receive_completions(None, completions("endpoint-boot", 2, Some(2)));
+        let mut completed = snapshot(AgentStatus::Idle, 2, 2);
+        presentation.project_snapshot(&mut completed);
+        assert_eq!(completed.agents[0].agent_status, AgentStatus::Done);
+
+        presentation.receive_completions(None, completions("endpoint-boot", 3, None));
+        for _ in 0..2 {
+            let mut acknowledged = snapshot(AgentStatus::Idle, 2, 3);
+
+            presentation.project_snapshot(&mut acknowledged);
+
+            assert_eq!(acknowledged.agents[0].agent_status, AgentStatus::Idle);
+        }
+    }
 }

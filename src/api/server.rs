@@ -74,6 +74,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        agent_completion_ack: true,
     })
 }
 
@@ -601,6 +602,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::TabClose(_) => "tab.close",
         Method::AgentList(_) => "agent.list",
         Method::AgentGet(_) => "agent.get",
+        Method::AgentAcknowledge(_) => "agent.acknowledge",
         Method::AgentRead(_) => "agent.read",
         Method::AgentExplain(_) => "agent.explain",
         Method::AgentSendKeys(_) => "agent.send_keys",
@@ -1443,6 +1445,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                agent_completion_ack: false,
             }),
             None,
             None,

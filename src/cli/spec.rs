@@ -320,6 +320,20 @@ fn agent_command() -> Command {
         .subcommand(Command::new("list").about("List agents"))
         .subcommand(id_command("get", "target", "Show an agent"))
         .subcommand(
+            Command::new("acknowledge")
+                .about("Confirm a recorded agent completion")
+                .override_usage(
+                    "herdr agent acknowledge <TARGET> --completion-seq <SEQ> --terminal-id <ID> [--session-value <VALUE>]",
+                )
+                .arg(required("target", "TARGET"))
+                .arg(option("completion-seq", "SEQ").required(true))
+                .arg(option("terminal-id", "ID").required(true))
+                .arg(option("session-value", "VALUE"))
+                .after_help(
+                    "Take all three token values from one `herdr agent get <TARGET> --json` read. A token whose terminal id or agent session no longer matches is rejected with agent_completion_stale.",
+                ),
+        )
+        .subcommand(
             Command::new("read")
                 .about("Read agent terminal output")
                 .override_usage("herdr agent read <TARGET> [OPTIONS]")

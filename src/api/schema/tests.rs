@@ -274,6 +274,44 @@ fn request_round_trips_for_agent_explain() {
 }
 
 #[test]
+fn request_round_trips_for_agent_acknowledge() {
+    let request = Request {
+        id: "req_agent_acknowledge".into(),
+        method: Method::AgentAcknowledge(AgentAcknowledgeParams {
+            target: "w1:p1".into(),
+            terminal_id: "term_1_2_3_4".into(),
+            completion_seq: 7,
+            agent_session_value: Some("session-1".into()),
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "agent.acknowledge");
+    assert_eq!(json["params"]["completion_seq"], 7);
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+}
+
+#[test]
+fn request_round_trips_for_agent_acknowledge_without_session_value() {
+    let request = Request {
+        id: "req_agent_acknowledge".into(),
+        method: Method::AgentAcknowledge(AgentAcknowledgeParams {
+            target: "w1:p1".into(),
+            terminal_id: "term_1_2_3_4".into(),
+            completion_seq: 7,
+            agent_session_value: None,
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "agent.acknowledge");
+    assert!(json["params"].get("agent_session_value").is_none());
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+}
+
+#[test]
 fn integration_list_request_and_response_round_trip() {
     let request = Request {
         id: "req_integrations".into(),
@@ -727,6 +765,7 @@ fn success_response_round_trips() {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                agent_completion_ack: false,
             }),
         },
     };

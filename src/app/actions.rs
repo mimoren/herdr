@@ -1708,6 +1708,7 @@ impl AppState {
                     .is_some_and(|change| change.previous_agent_label != change.agent_label);
             if completion_reset {
                 terminal.last_agent_completion_seq = None;
+                terminal.last_acked_agent_completion = None;
             }
             let managed_changed = terminal.reconcile_managed_agent_at(now, false);
             let suppress_acquisition_completion = terminal.finish_agent_process_acquisition();

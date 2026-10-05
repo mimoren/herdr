@@ -1,9 +1,10 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, ErrorBody,
-    ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
+    AgentAcknowledgeParams, AgentPromptParams, AgentPromptWaitOptions, AgentReadParams,
+    AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams,
+    EmptyParams, ErrorBody, ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat,
+    ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -18,6 +19,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
     match subcommand {
         "list" => agent_list(&args[1..]),
         "get" => agent_get(&args[1..]),
+        "acknowledge" => agent_acknowledge(&args[1..]),
         "read" => agent_read(&args[1..]),
         "send-keys" => agent_send_keys(&args[1..]),
         "prompt" => agent_prompt(&args[1..]),
@@ -461,6 +463,75 @@ fn agent_get(args: &[String]) -> std::io::Result<i32> {
         id: "cli:agent:get".into(),
         method: Method::AgentGet(AgentTarget {
             target: target.clone(),
+        }),
+    })?)
+}
+
+const AGENT_ACKNOWLEDGE_USAGE: &str = "usage: herdr agent acknowledge <target> --completion-seq <seq> --terminal-id <id> [--session-value <value>]";
+
+fn agent_acknowledge(args: &[String]) -> std::io::Result<i32> {
+    let Some(target) = args.first() else {
+        eprintln!("{AGENT_ACKNOWLEDGE_USAGE}");
+        return Ok(2);
+    };
+
+    let mut completion_seq = None;
+    let mut terminal_id = None;
+    let mut agent_session_value = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--completion-seq" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("--completion-seq requires a value");
+                    return Ok(2);
+                };
+                let Ok(seq) = value.parse::<u64>() else {
+                    eprintln!("--completion-seq must be a non-negative integer");
+                    return Ok(2);
+                };
+                completion_seq = Some(seq);
+                index += 2;
+            }
+            "--terminal-id" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("--terminal-id requires a value");
+                    return Ok(2);
+                };
+                terminal_id = Some(value.clone());
+                index += 2;
+            }
+            "--session-value" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("--session-value requires a value");
+                    return Ok(2);
+                };
+                agent_session_value = Some(value.clone());
+                index += 2;
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
+                eprintln!("{AGENT_ACKNOWLEDGE_USAGE}");
+                return Ok(2);
+            }
+        }
+    }
+
+    let (Some(completion_seq), Some(terminal_id)) = (completion_seq, terminal_id) else {
+        eprintln!(
+            "agent acknowledge requires --completion-seq and --terminal-id from the same \
+             `herdr agent get <target> --json` read"
+        );
+        return Ok(2);
+    };
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:acknowledge".into(),
+        method: Method::AgentAcknowledge(AgentAcknowledgeParams {
+            target: target.clone(),
+            terminal_id,
+            completion_seq,
+            agent_session_value,
         }),
     })?)
 }
@@ -933,6 +1004,9 @@ fn print_agent_help() {
     eprintln!("herdr agent commands:");
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
+    eprintln!(
+        "  herdr agent acknowledge <target> --completion-seq <seq> --terminal-id <id> [--session-value <value>]"
+    );
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send-keys <target> <key> [key ...]");
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");

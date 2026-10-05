@@ -72,6 +72,150 @@ impl App {
             })
     }
 
+    /// Confirm one already-recorded completion.
+    ///
+    /// The token must name the terminal instance, the completion sequence, and (when the caller
+    /// supplies it) the agent session the caller read from the same `agent.get`. A token minted by
+    /// an earlier server boot is rejected instead of clearing a newer completion that happens to
+    /// reuse the same sequence number. On success the only mutations are clearing the completion,
+    /// recording the acknowledgement for idempotence, and marking the pane seen.
+    pub(super) fn acknowledge_agent_completion(
+        &mut self,
+        target: &str,
+        params: &crate::api::schema::AgentAcknowledgeParams,
+    ) -> Result<AgentAcknowledgeResult, AgentAcknowledgeError> {
+        let resolved = self
+            .resolve_agent_target(target)
+            .map_err(AgentAcknowledgeError::Target)?;
+        let ws_idx = resolved.ws_idx;
+        let pane_id = resolved.pane_id;
+        let not_found = || {
+            AgentAcknowledgeError::Target(TerminalTargetError::NotFound {
+                target: target.to_string(),
+            })
+        };
+
+        // Compare against the same projection the caller read its token from.
+        let before = self.agent_info(ws_idx, pane_id).ok_or_else(not_found)?;
+        if before.terminal_id != params.terminal_id {
+            return Err(AgentAcknowledgeError::Stale(format!(
+                "agent {target} runs on terminal {} but the acknowledgement names {}; \
+                 the token belongs to an earlier terminal instance",
+                before.terminal_id, params.terminal_id
+            )));
+        }
+        if let Some(expected) = params.agent_session_value.as_deref() {
+            let actual = before
+                .agent_session
+                .as_ref()
+                .map(|session| session.value.as_str());
+            if actual != Some(expected) {
+                return Err(AgentAcknowledgeError::Stale(format!(
+                    "agent {target} session is {} but the acknowledgement names {expected}",
+                    actual.unwrap_or("none")
+                )));
+            }
+        }
+
+        let previous_seen = self.state.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .map(|pane| pane.seen)
+            .ok_or_else(not_found)?;
+
+        let (previous_state, previous_presentation, previous_agent_label, known_agent) = {
+            let terminal = self
+                .state
+                .terminals
+                .get(resolved.terminal_id.as_str())
+                .ok_or_else(not_found)?;
+            match terminal.last_agent_completion_seq {
+                Some(seq) if seq == params.completion_seq => {}
+                Some(seq) => {
+                    return Err(AgentAcknowledgeError::Stale(format!(
+                        "agent {target} records completion {seq}, not {}",
+                        params.completion_seq
+                    )));
+                }
+                None if terminal.last_acked_agent_completion == Some(params.completion_seq) => {
+                    return Ok(AgentAcknowledgeResult {
+                        agent: before,
+                        outcome: crate::api::schema::AgentAcknowledgeOutcome::AlreadyAcknowledged,
+                        state_update: None,
+                    });
+                }
+                None if terminal.last_agent_state_change_seq == Some(params.completion_seq) => {
+                    return Err(AgentAcknowledgeError::Absent(format!(
+                        "agent {target} transition {} recorded no completion to acknowledge",
+                        params.completion_seq
+                    )));
+                }
+                None => {
+                    return Err(AgentAcknowledgeError::Stale(format!(
+                        "agent {target} has no completion to acknowledge"
+                    )));
+                }
+            }
+            (
+                terminal.state,
+                terminal.effective_presentation(),
+                terminal.effective_agent_label().map(str::to_string),
+                terminal.effective_known_agent(),
+            )
+        };
+
+        // The decision table is finished; every remaining mutation is on the whitelist.
+        if let Some(terminal) = self.state.terminals.get_mut(resolved.terminal_id.as_str()) {
+            terminal.last_agent_completion_seq = None;
+            terminal.last_acked_agent_completion = Some(params.completion_seq);
+        }
+        if let Some(pane) = self.state.workspaces[ws_idx].pane_state_mut(pane_id) {
+            pane.seen = true;
+        }
+
+        let agent = self.agent_info(ws_idx, pane_id).ok_or_else(not_found)?;
+        Ok(AgentAcknowledgeResult {
+            agent,
+            outcome: crate::api::schema::AgentAcknowledgeOutcome::Acknowledged,
+            state_update: Some(crate::app::actions::PaneStateUpdate {
+                pane_id,
+                ws_idx,
+                previous_agent_label: previous_agent_label.clone(),
+                previous_known_agent: known_agent,
+                previous_state,
+                previous_seen,
+                previous_presentation: previous_presentation.clone(),
+                agent_label: previous_agent_label,
+                known_agent,
+                state: previous_state,
+                seen: true,
+                presentation: previous_presentation,
+                agent_name_changed: false,
+                agent_released: false,
+                agent_release_status: None,
+                // An acknowledgement is not a state transition, so it must never produce a
+                // toast, sound, or semantic notification on its own.
+                suppress_completion: true,
+            }),
+        })
+    }
+
+    pub(super) fn agent_acknowledge_error_body(
+        &self,
+        error: AgentAcknowledgeError,
+    ) -> crate::api::schema::ErrorBody {
+        match error {
+            AgentAcknowledgeError::Target(error) => self.agent_target_error_body(error),
+            AgentAcknowledgeError::Stale(message) => crate::api::schema::ErrorBody {
+                code: "agent_completion_stale".into(),
+                message,
+            },
+            AgentAcknowledgeError::Absent(message) => crate::api::schema::ErrorBody {
+                code: "agent_completion_absent".into(),
+                message,
+            },
+        }
+    }
+
     pub(super) fn focus_agent_target(
         &mut self,
         target: &str,
@@ -459,6 +603,24 @@ pub(super) enum AgentStartError {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,
     },
+}
+
+/// Result of one `agent.acknowledge` call. `state_update` is the presentation change the API
+/// handler must emit; it is `None` when the acknowledgement changed no status.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct AgentAcknowledgeResult {
+    pub agent: crate::api::schema::AgentInfo,
+    pub outcome: crate::api::schema::AgentAcknowledgeOutcome,
+    pub state_update: Option<crate::app::actions::PaneStateUpdate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum AgentAcknowledgeError {
+    Target(TerminalTargetError),
+    /// The token does not describe the completion currently recorded for this terminal instance.
+    Stale(String),
+    /// The named transition recorded no completion because it was suppressed.
+    Absent(String),
 }
 
 pub(super) enum AgentRenameError {

@@ -52,6 +52,29 @@ impl App {
         encode_success(id, ResponseResult::AgentInfo { agent })
     }
 
+    pub(super) fn handle_agent_acknowledge(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentAcknowledgeParams,
+    ) -> String {
+        let acknowledged = match self.acknowledge_agent_completion(&params.target, &params) {
+            Ok(acknowledged) => acknowledged,
+            Err(err) => return encode_error_body(id, self.agent_acknowledge_error_body(err)),
+        };
+
+        if let Some(update) = acknowledged.state_update.as_ref() {
+            self.emit_pane_state_update(update);
+        }
+
+        encode_success(
+            id,
+            ResponseResult::AgentCompletionAcknowledged {
+                agent: acknowledged.agent,
+                outcome: acknowledged.outcome,
+            },
+        )
+    }
+
     pub(super) fn handle_agent_focus(&mut self, id: String, target: AgentTarget) -> String {
         let agent = match self.focus_agent_target(&target.target) {
             Ok(agent) => agent,
@@ -400,21 +423,26 @@ mod tests {
         workspace::Workspace,
     };
 
-    fn app_with_agent() -> App {
+    fn app_with_agent_and_events() -> (App, crate::api::EventHub) {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let event_hub = crate::api::EventHub::default();
         let mut app = App::new(
             &Config::default(),
             crate::app::AppPolicy::TEST,
             None,
             api_rx,
-            crate::api::EventHub::default(),
+            event_hub.clone(),
         );
         app.state.workspaces = vec![Workspace::test_new("agent")];
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app
+        (app, event_hub)
+    }
+
+    fn app_with_agent() -> App {
+        app_with_agent_and_events().0
     }
 
     fn start_deferred_agent_prompt(
@@ -819,5 +847,512 @@ mod tests {
                 Some("shell-pane")
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // agent.acknowledge
+    // -----------------------------------------------------------------------
+
+    /// Two workspaces with the agent in the background tab. That is the case a background
+    /// acknowledgement exists for: the completion stays unacknowledged (Done) without focus.
+    fn app_with_background_pane() -> (App, crate::layout::PaneId, crate::api::EventHub) {
+        let (mut app, event_hub) = app_with_agent_and_events();
+        app.state.workspaces = vec![
+            Workspace::test_new("active"),
+            Workspace::test_new("background"),
+        ];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let pane_id = app.state.workspaces[1].tabs[0].root_pane;
+        (app, pane_id, event_hub)
+    }
+
+    fn app_with_background_completion() -> (App, crate::layout::PaneId, crate::api::EventHub) {
+        let (mut app, pane_id, event_hub) = app_with_background_pane();
+        record_completion(&mut app, pane_id);
+        (app, pane_id, event_hub)
+    }
+
+    fn record_completion(app: &mut App, pane_id: crate::layout::PaneId) {
+        for state in [AgentState::Working, AgentState::Idle] {
+            record_state(app, pane_id, state);
+        }
+    }
+
+    fn record_state(app: &mut App, pane_id: crate::layout::PaneId, state: AgentState) {
+        let updates = app
+            .state
+            .handle_app_event(crate::events::AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Pi),
+                state,
+                visible_blocker: false,
+                visible_working: state == AgentState::Working,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+        for update in &updates {
+            app.emit_pane_state_update(update);
+        }
+    }
+
+    /// The projection a caller reads its token from, exactly as `agent get --json` returns it.
+    fn agent_token(
+        app: &App,
+        pane_id: crate::layout::PaneId,
+    ) -> crate::api::schema::AgentAcknowledgeParams {
+        let agent = app
+            .agent_info(1, pane_id)
+            .expect("background pane hosts an agent");
+        crate::api::schema::AgentAcknowledgeParams {
+            target: agent.pane_id.clone(),
+            terminal_id: agent.terminal_id,
+            completion_seq: agent.completion_seq.unwrap_or(agent.state_change_seq),
+            agent_session_value: agent.agent_session.map(|session| session.value),
+        }
+    }
+
+    fn acknowledge(
+        app: &mut App,
+        params: crate::api::schema::AgentAcknowledgeParams,
+    ) -> serde_json::Value {
+        serde_json::from_str(&app.handle_agent_acknowledge("req_ack".into(), params)).unwrap()
+    }
+
+    fn acknowledged(
+        response: serde_json::Value,
+    ) -> (
+        crate::api::schema::AgentInfo,
+        crate::api::schema::AgentAcknowledgeOutcome,
+    ) {
+        let success: SuccessResponse = serde_json::from_value(response).unwrap();
+        let ResponseResult::AgentCompletionAcknowledged { agent, outcome } = success.result else {
+            panic!("expected an acknowledged completion result");
+        };
+        (agent, outcome)
+    }
+
+    fn rejected(response: serde_json::Value) -> String {
+        let error: crate::api::schema::ErrorResponse = serde_json::from_value(response).unwrap();
+        error.error.code
+    }
+
+    fn background_terminal(
+        app: &App,
+        pane_id: crate::layout::PaneId,
+    ) -> &crate::terminal::TerminalState {
+        let terminal_id = &app.state.workspaces[1].tabs[0].panes[&pane_id].attached_terminal_id;
+        app.state
+            .terminals
+            .get(terminal_id)
+            .expect("background terminal exists")
+    }
+
+    fn background_seen(app: &App, pane_id: crate::layout::PaneId) -> bool {
+        app.state.workspaces[1]
+            .pane_state(pane_id)
+            .expect("background pane exists")
+            .seen
+    }
+
+    fn set_reported_session(app: &mut App, pane_id: crate::layout::PaneId, value: &str) {
+        let terminal_id = app.state.workspaces[1].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("background terminal exists");
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef {
+                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                value: value.to_string(),
+            },
+        });
+    }
+
+    /// Same `micros`/`counter` tail with a different process epoch: what an earlier server boot
+    /// mints for the same pane id.
+    fn foreign_boot_terminal_id(terminal_id: &str) -> String {
+        let parts: Vec<&str> = terminal_id.split('_').collect();
+        assert_eq!(
+            parts.len(),
+            5,
+            "unexpected terminal id shape: {terminal_id}"
+        );
+        format!("term_ffffffff_ffffffff_{}_{}", parts[3], parts[4])
+    }
+
+    #[test]
+    fn completion_ack_normal_clears_completion_and_clears_done() {
+        let (mut app, pane_id, _event_hub) = app_with_background_completion();
+        assert_eq!(
+            app.agent_info(1, pane_id).unwrap().agent_status,
+            AgentStatus::Done
+        );
+        let token = agent_token(&app, pane_id);
+        let seq = token.completion_seq;
+
+        let (agent, outcome) = acknowledged(acknowledge(&mut app, token));
+
+        assert_eq!(
+            outcome,
+            crate::api::schema::AgentAcknowledgeOutcome::Acknowledged
+        );
+        assert_eq!(agent.agent_status, AgentStatus::Idle);
+        assert_eq!(agent.completion_seq, None);
+        let terminal = background_terminal(&app, pane_id);
+        assert_eq!(terminal.last_agent_completion_seq, None);
+        assert_eq!(terminal.last_acked_agent_completion, Some(seq));
+        assert!(background_seen(&app, pane_id));
+        assert_eq!(
+            app.agent_info(1, pane_id).unwrap().agent_status,
+            AgentStatus::Idle
+        );
+    }
+
+    #[test]
+    fn completion_ack_repeat_is_idempotent() {
+        let (mut app, pane_id, event_hub) = app_with_background_completion();
+        let token = agent_token(&app, pane_id);
+        let seq = token.completion_seq;
+        let (_, first) = acknowledged(acknowledge(&mut app, token.clone()));
+        assert_eq!(
+            first,
+            crate::api::schema::AgentAcknowledgeOutcome::Acknowledged
+        );
+
+        let before = event_hub.current_sequence();
+        let (agent, second) = acknowledged(acknowledge(&mut app, token));
+
+        assert_eq!(
+            second,
+            crate::api::schema::AgentAcknowledgeOutcome::AlreadyAcknowledged
+        );
+        assert_eq!(agent.agent_status, AgentStatus::Idle);
+        let terminal = background_terminal(&app, pane_id);
+        assert_eq!(terminal.last_agent_completion_seq, None);
+        assert_eq!(terminal.last_acked_agent_completion, Some(seq));
+        assert!(background_seen(&app, pane_id));
+        assert!(
+            event_hub.events_after(before).is_empty(),
+            "a repeated acknowledgement must not publish another event"
+        );
+    }
+
+    #[test]
+    fn completion_ack_rejects_old_sequence() {
+        let (mut app, pane_id, event_hub) = app_with_background_completion();
+        let stale = agent_token(&app, pane_id);
+        record_completion(&mut app, pane_id);
+        let fresh = agent_token(&app, pane_id);
+        assert_ne!(stale.completion_seq, fresh.completion_seq);
+        let before = event_hub.current_sequence();
+
+        let code = rejected(acknowledge(&mut app, stale));
+
+        assert_eq!(code, "agent_completion_stale");
+        let terminal = background_terminal(&app, pane_id);
+        assert_eq!(
+            terminal.last_agent_completion_seq,
+            Some(fresh.completion_seq)
+        );
+        assert_eq!(terminal.last_acked_agent_completion, None);
+        assert!(!background_seen(&app, pane_id));
+        assert_eq!(
+            app.agent_info(1, pane_id).unwrap().agent_status,
+            AgentStatus::Done
+        );
+        assert!(event_hub.events_after(before).is_empty());
+    }
+
+    #[test]
+    fn completion_ack_rejects_foreign_terminal() {
+        let (mut app, pane_id, event_hub) = app_with_background_completion();
+        let token = agent_token(&app, pane_id);
+        let before = event_hub.current_sequence();
+
+        let mut foreign = token.clone();
+        foreign.terminal_id = foreign_boot_terminal_id(&token.terminal_id);
+        assert_ne!(foreign.terminal_id, token.terminal_id);
+        assert_eq!(
+            rejected(acknowledge(&mut app, foreign)),
+            "agent_completion_stale"
+        );
+
+        let mut unknown = token.clone();
+        unknown.terminal_id = "term_0_0_0_0".into();
+        assert_eq!(
+            rejected(acknowledge(&mut app, unknown)),
+            "agent_completion_stale"
+        );
+
+        let terminal = background_terminal(&app, pane_id);
+        assert_eq!(
+            terminal.last_agent_completion_seq,
+            Some(token.completion_seq)
+        );
+        assert_eq!(terminal.last_acked_agent_completion, None);
+        assert!(!background_seen(&app, pane_id));
+        assert!(event_hub.events_after(before).is_empty());
+    }
+
+    #[test]
+    fn completion_ack_rejects_replaced_agent_session() {
+        let (mut app, pane_id, event_hub) = app_with_background_completion();
+        set_reported_session(&mut app, pane_id, "session-a");
+        let token = agent_token(&app, pane_id);
+        assert_eq!(token.agent_session_value.as_deref(), Some("session-a"));
+        set_reported_session(&mut app, pane_id, "session-b");
+        assert_eq!(
+            app.agent_info(1, pane_id)
+                .unwrap()
+                .agent_session
+                .map(|session| session.value)
+                .as_deref(),
+            Some("session-b")
+        );
+        let before = event_hub.current_sequence();
+
+        let code = rejected(acknowledge(&mut app, token));
+
+        assert_eq!(code, "agent_completion_stale");
+        assert_eq!(
+            background_terminal(&app, pane_id).last_acked_agent_completion,
+            None
+        );
+        assert!(event_hub.events_after(before).is_empty());
+    }
+
+    #[test]
+    fn completion_ack_does_not_touch_working_or_blocked() {
+        for blocked in [false, true] {
+            let (mut app, pane_id, event_hub) = app_with_background_pane();
+            record_state(&mut app, pane_id, AgentState::Working);
+            if blocked {
+                record_state(&mut app, pane_id, AgentState::Blocked);
+            }
+            let expected = if blocked {
+                AgentState::Blocked
+            } else {
+                AgentState::Working
+            };
+            let expected_status = if blocked {
+                AgentStatus::Blocked
+            } else {
+                AgentStatus::Working
+            };
+            let before = event_hub.current_sequence();
+            let mut pending_before: Vec<_> = app
+                .state
+                .pending_agent_notifications
+                .keys()
+                .copied()
+                .collect();
+            pending_before.sort_by_key(|pane| pane.raw());
+
+            let mut mismatched = agent_token(&app, pane_id);
+            assert_eq!(
+                rejected(acknowledge(&mut app, mismatched.clone())),
+                "agent_completion_absent"
+            );
+            mismatched.completion_seq += 1;
+            assert_eq!(
+                rejected(acknowledge(&mut app, mismatched)),
+                "agent_completion_stale"
+            );
+
+            let terminal = background_terminal(&app, pane_id);
+            assert_eq!(terminal.state, expected);
+            assert_eq!(terminal.last_agent_completion_seq, None);
+            assert_eq!(terminal.last_acked_agent_completion, None);
+            assert_eq!(
+                app.agent_info(1, pane_id).unwrap().agent_status,
+                expected_status
+            );
+            let mut pending_after: Vec<_> = app
+                .state
+                .pending_agent_notifications
+                .keys()
+                .copied()
+                .collect();
+            pending_after.sort_by_key(|pane| pane.raw());
+            assert_eq!(pending_before, pending_after);
+            assert!(event_hub.events_after(before).is_empty());
+        }
+    }
+
+    #[test]
+    fn completion_ack_without_completion_is_absent() {
+        // Unknown -> Idle moves the state sequence without recording a completion, so a matching
+        // sequence must still report that there is nothing to acknowledge.
+        let (mut app, pane_id, event_hub) = app_with_background_pane();
+        record_state(&mut app, pane_id, AgentState::Idle);
+        let terminal = background_terminal(&app, pane_id);
+        assert_eq!(terminal.last_agent_completion_seq, None);
+        let seen_before = background_seen(&app, pane_id);
+        let before = event_hub.current_sequence();
+
+        let token = agent_token(&app, pane_id);
+        let code = rejected(acknowledge(&mut app, token));
+
+        assert_eq!(code, "agent_completion_absent");
+        assert_eq!(background_seen(&app, pane_id), seen_before);
+        assert!(event_hub.events_after(before).is_empty());
+    }
+
+    #[test]
+    fn completion_ack_missing_pane_or_agent_is_not_found() {
+        let (mut app, _pane_id, _event_hub) = app_with_background_pane();
+        let shell_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let shell_target = app
+            .public_pane_id(0, shell_pane)
+            .expect("active shell pane has a public id");
+
+        for target in [shell_target, "no-such-agent".to_string()] {
+            let code = rejected(acknowledge(
+                &mut app,
+                crate::api::schema::AgentAcknowledgeParams {
+                    target,
+                    terminal_id: "term_0_0_0_0".into(),
+                    completion_seq: 1,
+                    agent_session_value: None,
+                },
+            ));
+            assert_eq!(code, "agent_not_found");
+        }
+    }
+
+    #[test]
+    fn completion_ack_interleaved_with_new_completion() {
+        let (mut app, pane_id, _event_hub) = app_with_background_completion();
+        let stale = agent_token(&app, pane_id);
+        record_completion(&mut app, pane_id);
+        let fresh = agent_token(&app, pane_id);
+        assert_ne!(stale.completion_seq, fresh.completion_seq);
+
+        assert_eq!(
+            rejected(acknowledge(&mut app, stale)),
+            "agent_completion_stale"
+        );
+        let (agent, outcome) = acknowledged(acknowledge(&mut app, fresh.clone()));
+
+        assert_eq!(
+            outcome,
+            crate::api::schema::AgentAcknowledgeOutcome::Acknowledged
+        );
+        assert_eq!(agent.completion_seq, None);
+        assert_eq!(
+            background_terminal(&app, pane_id).last_acked_agent_completion,
+            Some(fresh.completion_seq)
+        );
+    }
+
+    #[test]
+    fn completion_ack_preserves_focus_workspace_tab_and_identity() {
+        let (mut app, pane_id, _event_hub) = app_with_background_completion();
+        let before_agent = app.agent_info(1, pane_id).unwrap();
+        let before_state = (
+            app.state.active,
+            app.state.selected,
+            app.state.mode,
+            app.state.workspaces[0].id.clone(),
+            app.state.workspaces[1].id.clone(),
+            app.state.workspaces[1].active_tab,
+            app.state.workspaces[1].focused_pane_id(),
+            app.state.workspaces[1].tabs[0].number,
+        );
+        let before_identity = (
+            before_agent.terminal_id.clone(),
+            before_agent.workspace_id.clone(),
+            before_agent.tab_id.clone(),
+            before_agent.pane_id.clone(),
+            before_agent.name.clone(),
+            before_agent.agent.clone(),
+            before_agent.agent_session.clone(),
+            before_agent.revision,
+            before_agent.state_change_seq,
+        );
+        let token = agent_token(&app, pane_id);
+
+        let (_, outcome) = acknowledged(acknowledge(&mut app, token));
+
+        assert_eq!(
+            outcome,
+            crate::api::schema::AgentAcknowledgeOutcome::Acknowledged
+        );
+        let after_agent = app.agent_info(1, pane_id).unwrap();
+        let after_state = (
+            app.state.active,
+            app.state.selected,
+            app.state.mode,
+            app.state.workspaces[0].id.clone(),
+            app.state.workspaces[1].id.clone(),
+            app.state.workspaces[1].active_tab,
+            app.state.workspaces[1].focused_pane_id(),
+            app.state.workspaces[1].tabs[0].number,
+        );
+        let after_identity = (
+            after_agent.terminal_id.clone(),
+            after_agent.workspace_id.clone(),
+            after_agent.tab_id.clone(),
+            after_agent.pane_id.clone(),
+            after_agent.name.clone(),
+            after_agent.agent.clone(),
+            after_agent.agent_session.clone(),
+            after_agent.revision,
+            after_agent.state_change_seq,
+        );
+        assert_eq!(before_state, after_state);
+        assert_eq!(before_identity, after_identity);
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn agent_completion_acknowledged_response_round_trips() {
+        let (mut app, pane_id, _event_hub) = app_with_background_completion();
+        let token = agent_token(&app, pane_id);
+
+        let response = app.handle_agent_acknowledge("req_round_trip".into(), token);
+
+        let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            parsed.result,
+            ResponseResult::AgentCompletionAcknowledged { .. }
+        ));
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["type"], "agent_completion_acknowledged");
+        assert_eq!(value["result"]["outcome"], "acknowledged");
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            value,
+            "the acknowledged response must re-encode to the same wire shape"
+        );
+    }
+
+    #[test]
+    fn completion_ack_emits_status_change_event_only() {
+        let (mut app, pane_id, event_hub) = app_with_background_completion();
+        let token = agent_token(&app, pane_id);
+        let before = event_hub.current_sequence();
+
+        acknowledged(acknowledge(&mut app, token));
+
+        let events = event_hub.events_after(before);
+        assert_eq!(events.len(), 1, "unexpected events: {events:?}");
+        assert_eq!(
+            events[0].1.event,
+            crate::api::schema::EventKind::PaneAgentStatusChanged
+        );
+        let crate::api::schema::EventData::PaneAgentStatusChanged { agent_status, .. } =
+            &events[0].1.data
+        else {
+            panic!("expected a pane agent status change payload");
+        };
+        assert_eq!(*agent_status, AgentStatus::Idle);
     }
 }

@@ -200,7 +200,7 @@ fn encode_string(value: &str) -> Vec<u8> {
     encoded
 }
 
-fn decode_string(payload: &[u8], offset: &mut usize) -> Result<String, String> {
+pub fn decode_string(payload: &[u8], offset: &mut usize) -> Result<String, String> {
     let (len, consumed) = decode_varint_u32(payload, *offset)?;
     *offset += consumed;
     let len = len as usize;

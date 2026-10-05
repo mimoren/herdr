@@ -36,4 +36,8 @@ pub struct ServerCapabilities {
     /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
     #[serde(default)]
     pub ssh_agent_registration: bool,
+    /// Whether this server accepts `agent.acknowledge` for a recorded completion. Older servers
+    /// reject the method entirely, and `AgentInfo.completion_seq` alone cannot distinguish them.
+    #[serde(default)]
+    pub agent_completion_ack: bool,
 }

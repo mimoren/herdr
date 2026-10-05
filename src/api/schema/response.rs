@@ -107,6 +107,10 @@ pub enum ResponseResult {
     AgentList {
         agents: Vec<AgentInfo>,
     },
+    AgentCompletionAcknowledged {
+        agent: AgentInfo,
+        outcome: AgentAcknowledgeOutcome,
+    },
     AgentView {
         active: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -278,6 +282,13 @@ pub enum ResponseResult {
         projection_revision: u64,
     },
     Ok {},
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAcknowledgeOutcome {
+    Acknowledged,
+    AlreadyAcknowledged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

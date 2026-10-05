@@ -42,6 +42,20 @@ pub struct AgentPromptWaitOptions {
     pub(crate) submission_deadline: Option<std::time::Instant>,
 }
 
+/// Identity-bound confirmation of one already-recorded agent completion.
+///
+/// `terminal_id`, `completion_seq`, and (when present) `agent_session_value` must all come from
+/// the same `agent.get` read, so a token minted by an earlier server boot is rejected instead of
+/// clearing a newer completion that happens to reuse the same sequence number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentAcknowledgeParams {
+    pub target: String,
+    pub terminal_id: String,
+    pub completion_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_value: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentRenameParams {
     pub target: String,

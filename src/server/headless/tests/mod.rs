@@ -801,6 +801,119 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
     }
 }
 
+/// A background acknowledgement is a server-side change, so every attached client must converge on
+/// the cleared projection without that client having focused or viewed the pane.
+#[tokio::test]
+async fn completion_ack_clears_completions_for_every_attached_client() {
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("endpoint");
+    let pane_id = workspace.tabs[0].root_pane;
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+
+    let (writer, first_control, _first_render) = test_client_writer();
+    let (second_writer, second_control, _second_render) = test_client_writer();
+    for (client_id, writer) in [(78_u64, writer), (79_u64, second_writer)] {
+        assert!(
+            server.handle_server_event(ServerEvent::ClientShellConnected {
+                client_id,
+                surface_cols: 80,
+                surface_rows: 24,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                pixel_mouse: false,
+                direct_graphics: false,
+                endpoint_keybindings: false,
+                mouse_capture: false,
+                surface_active: false,
+                surface_reuse: false,
+                surface_delta: false,
+                surface_scroll: false,
+                writer,
+            })
+        );
+    }
+    let (_, first_initial) = client_shell_projection(&first_control);
+    let (_, second_initial) = client_shell_projection(&second_control);
+    assert!(first_initial.completions.is_empty());
+    assert!(second_initial.completions.is_empty());
+
+    for state in [
+        crate::detect::AgentState::Working,
+        crate::detect::AgentState::Idle,
+    ] {
+        server.app.state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Pi),
+            state,
+            visible_blocker: false,
+            visible_working: state == crate::detect::AgentState::Working,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+    }
+    server.render_and_stream();
+    let (completed, first_completed) = client_shell_projection(&first_control);
+    let (_, second_completed) = client_shell_projection(&second_control);
+    assert_eq!(completed.agents.len(), 1);
+    let pane_label = completed.agents[0].pane_id.clone();
+    let state_change_seq = completed.agents[0].state_change_seq;
+    let api_agent = server.app.session_snapshot().agents[0].clone();
+    assert_eq!(api_agent.pane_id, pane_label);
+    let recorded = api_agent.completion_seq.expect("completion is recorded");
+    assert_eq!(
+        first_completed.completions.get(&pane_label).copied(),
+        Some(recorded)
+    );
+    assert_eq!(
+        second_completed.completions.get(&pane_label).copied(),
+        Some(recorded)
+    );
+
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        request: api::schema::Request {
+            id: "ack".into(),
+            method: api::schema::Method::AgentAcknowledge(api::schema::AgentAcknowledgeParams {
+                target: api_agent.pane_id.clone(),
+                terminal_id: api_agent.terminal_id.clone(),
+                completion_seq: recorded,
+                agent_session_value: api_agent.agent_session.map(|session| session.value),
+            }),
+        },
+        respond_to,
+        response_write_complete: None,
+    });
+    let response: api::schema::SuccessResponse =
+        serde_json::from_str(&response_rx.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
+    let api::schema::ResponseResult::AgentCompletionAcknowledged { outcome, .. } = response.result
+    else {
+        panic!("expected an acknowledged completion result");
+    };
+    assert_eq!(outcome, api::schema::AgentAcknowledgeOutcome::Acknowledged);
+
+    server.render_and_stream();
+    let (first_after, first_projection) = client_shell_projection(&first_control);
+    let (second_after, second_projection) = client_shell_projection(&second_control);
+
+    for (snapshot, projection) in [
+        (&first_after, first_projection),
+        (&second_after, second_projection),
+    ] {
+        assert_eq!(
+            snapshot.agents[0].agent_status,
+            api::schema::AgentStatus::Idle
+        );
+        assert_eq!(snapshot.agents[0].state_change_seq, state_change_seq);
+        assert!(
+            !projection.completions.contains_key(&pane_label),
+            "an acknowledged completion must leave every client's companion"
+        );
+    }
+    assert_eq!(server.app.session_snapshot().agents[0].completion_seq, None);
+}
+
 #[tokio::test]
 async fn client_shell_endpoint_request_uses_the_selected_connection() {
     let mut server = test_headless_server();
